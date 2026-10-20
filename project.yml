@@ -1,0 +1,25 @@
+name: Toilettes
+options:
+  bundleIdPrefix: fr.example
+  deploymentTarget:
+    iOS: "27.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    # Renseignez votre équipe pour installer sur un iPhone (ou réglez-la dans Xcode > Signing)
+    DEVELOPMENT_TEAM: ""
+targets:
+  Toilettes:
+    type: application
+    platform: iOS
+    sources: [Toilettes]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: fr.example.toilettes
+        TARGETED_DEVICE_FAMILY: "1"
+    info:
+      path: Toilettes/Info.plist
+      properties:
+        CFBundleDisplayName: Toilettes
+        UILaunchScreen: {}
+        NSLocationWhenInUseUsageDescription: "Votre position sert à trouver les toilettes les plus proches de vous."
