@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Toilettes">
+<title>Toilettes à proximité</title>
+<meta name="version" content="1.2.0">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E🚻%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+:root{--bg:#fff;--fg:#111;--mut:#666;--card:rgba(255,255,255,.95);--acc:#0a66ff}
+@media(prefers-color-scheme:dark){:root{--bg:#111;--fg:#f2f2f2;--mut:#aaa;--card:rgba(32,32,34,.95);--acc:#4c8dff}}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:16px/1.35 -apple-system,system-ui,sans-serif}
+#map{position:fixed;inset:0}
+.bar{position:fixed;top:0;left:0;right:0;z-index:1000;padding:calc(env(safe-area-inset-top,0px) + 8px) 10px 0;display:flex;flex-direction:column;gap:6px;align-items:center;pointer-events:none}
+.bar>*{pointer-events:auto}
+.row{display:flex;gap:8px}
+button,select,.btn{font:inherit;border:0;border-radius:999px;padding:9px 14px;background:var(--card);color:var(--fg);box-shadow:0 1px 6px #0003;text-decoration:none;text-align:center}
+.pri{background:var(--acc);color:#fff}
+#status{font-size:13px;background:var(--card);padding:4px 10px;border-radius:999px;box-shadow:0 1px 6px #0003}
+#ver{font-size:11px;color:var(--mut);background:var(--card);padding:1px 8px;border-radius:999px}
+#card{position:fixed;z-index:1000;left:10px;right:10px;bottom:calc(env(safe-area-inset-bottom,0px) + 10px);max-width:520px;margin:0 auto;background:var(--card);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-radius:18px;padding:14px;box-shadow:0 2px 12px #0004;display:none}
+#card .top{display:flex;justify-content:space-between;gap:8px}
+#card .acts{display:flex;gap:8px;margin-top:10px}
+#card .acts .btn{flex:1}
+.mut{color:var(--mut);font-size:14px}
+.pin{display:grid;place-items:center;width:32px;height:32px;border-radius:50%;background:var(--acc);font-size:17px;border:2px solid #fff;box-shadow:0 1px 5px #0006}
+.pin.sel{background:#e5484d;transform:scale(1.25)}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="bar">
+  <div class="row">
+    <button class="pri" id="search">Rechercher ici</button>
+    <select id="radius" aria-label="Rayon"><option value="500">500 m</option><option value="1000" selected>1 km</option><option value="2000">2 km</option><option value="5000">5 km</option></select>
+    <button id="locate" aria-label="Ma position">📍</button>
+  </div>
+  <div id="status">Localisation en cours…</div>
+  <div id="ver">v1.2.0 · 20/10/2026</div>
+</div>
+<div id="card"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const cap = s => s.toLowerCase().replace(/(^|\s)\S/g, c => c.toUpperCase());
+const status = t => $('#status').textContent = t;
+const dist = (a, b) => { const r = Math.PI/180, R = 6371000, p = (b.lat-a.lat)*r, q = (b.lon-a.lon)*r;
+  const x = Math.sin(p/2)**2 + Math.cos(a.lat*r)*Math.cos(b.lat*r)*Math.sin(q/2)**2; return 2*R*Math.asin(Math.sqrt(x)); };
+const fmt = m => m < 1000 ? Math.round(m) + ' m' : (m/1000).toFixed(1).replace('.', ',') + ' km';
+
+const map = L.map('map', {zoomControl:false}).setView([48.8566, 2.3522], 13);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19,
+  attribution:'© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'}).addTo(map);
+const group = L.layerGroup().addTo(map);
+let me = null, meMarker = null, started = false, selected = null, markers = new Map();
+const icon = sel => L.divIcon({className:'', html:`<div class="pin${sel?' sel':''}">🚻</div>`, iconSize:[32,32], iconAnchor:[16,16]});
+
+/* ---------- Sources de données ---------- */
+const fetchT = (url, opts = {}, ms = 8000) => {   // abandon après ms millisecondes
+  const ctl = new AbortController(), id = setTimeout(() => ctl.abort(), ms);
+  return fetch(url, {...opts, signal:ctl.signal}).finally(() => clearTimeout(id));
+};
+const OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.private.coffee/api/interpreter'];
+async function overpass(c, r) {
+  const a = `(around:${r},${c.lat},${c.lon})`;
+  const q = `[out:json][timeout:15];(node["amenity"="toilets"]${a};way["amenity"="toilets"]${a};);out center tags qt;`;
+  const run = async u => {
+    const res = await fetchT(u, {method:'POST', body:'data=' + encodeURIComponent(q),
+      headers:{'Content-Type':'application/x-www-form-urlencoded'}}, 15000);
+    if (!res.ok) throw new Error(res.status);
+    return res.json();
+  };
+  const j = await Promise.any(OVERPASS.map(run));   // les deux serveurs en parallèle : le plus rapide gagne
+  return j.elements.map(e => {
+    const lat = e.lat ?? e.center?.lat, lon = e.lon ?? e.center?.lon, t = e.tags || {};
+    if (lat == null || lon == null || ['private','no'].includes(t.access)) return null;
+    return {id:e.type + e.id, lat, lon, t, source:'OpenStreetMap'};
+  }).filter(Boolean);
+}
+
+// box = [latMin, latMax, lonMin, lonMax] : la source n'est interrogée que si la recherche tombe dans cette zone
+const ODS = [
+  {key:'paris', host:'https://opendata.paris.fr', ds:'sanisettesparis', name:'Ville de Paris (open data)', consolidated:false, box:[48.78, 48.94, 2.20, 2.50]},
+  {key:'idf', host:'https://data.iledefrance.fr', ds:'toilettes-publiques-en-ile-de-france', name:'Région Île-de-France (open data)', consolidated:true, box:[47.9, 49.3, 1.4, 3.7]}
+];
+const inBox = (c, b) => c.lat >= b[0] && c.lat <= b[1] && c.lon >= b[2] && c.lon <= b[3];
+const txt = (f, ks) => { for (const k of ks) if (typeof f[k] === 'string' && f[k]) return f[k]; return null; };
+const yes = (f, ks) => { for (const k of ks) { const v = f[k];
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'string') return ['oui','yes','true','1'].includes(v.toLowerCase()); } return false; };
+
+function fromODS(s, x) {
+  const f = x.f, t = {};
+  if (s.key === 'paris') {
+    if ((f.statut || '').toLowerCase().includes('ferm')) return null;
+    const type = f.type || '';
+    t.name = type ? cap(type) : 'Sanisette';
+    t.fee = type.toLowerCase().includes('lavatory') ? 'yes' : 'no';   // « Lavatory » = accès payant
+    if (yes(f, ['acces_pmr'])) t.wheelchair = 'yes';
+    if (yes(f, ['relais_bebe'])) t.changing_table = 'yes';
+    t.opening_hours = txt(f, ['horaire']);
+    t.address = [txt(f, ['adresse']), txt(f, ['arrondissement'])].filter(Boolean).join(', ');
+  } else {
+    t.name = txt(f, ['nom','name','libelle']);
+    if (yes(f, ['acces_pmr','pmr','wheelchair'])) t.wheelchair = 'yes';
+    t.opening_hours = txt(f, ['horaires','horaire','opening_hours']);
+    t.address = [txt(f, ['adresse','address']), txt(f, ['commune','ville'])].filter(Boolean).join(', ');
+  }
+  return {id:s.key + x.lat + x.lon, lat:x.lat, lon:x.lon, t, source:s.name};
+}
+
+async function pages(urlFn, parse) {
+  const all = [];
+  for (let p = 0; p < 5; p++) {
+    let out;
+    try { const res = await fetchT(urlFn(p*100)); if (!res.ok) throw 0; out = parse(await res.json()); } catch { out = null; }
+    if (!out) return p ? all : null;
+    all.push(...out.rows);
+    if (out.raw < 100) break;
+  }
+  return all;
+}
+async function odsRows(s, c, r) {
+  // API v1 (filtre géographique indépendant du nom du champ), puis repli sur l'API v2.1
+  const v1 = await pages(o => `${s.host}/api/records/1.0/search/?dataset=${s.ds}&rows=100&start=${o}&geofilter.distance=${c.lat},${c.lon},${r}`,
+    j => j.records && {raw:j.records.length, rows:j.records.filter(x => x.geometry?.coordinates)
+      .map(x => ({f:x.fields || {}, lat:x.geometry.coordinates[1], lon:x.geometry.coordinates[0]}))});
+  if (v1) return v1;
+  const w = encodeURIComponent(`within_distance(geo_point_2d, geom'POINT(${c.lon} ${c.lat})', ${r}m)`);
+  const v2 = await pages(o => `${s.host}/api/explore/v2.1/catalog/datasets/${s.ds}/records?where=${w}&limit=100&offset=${o}`,
+    j => j.results && {raw:j.results.length, rows:j.results.filter(x => x.geo_point_2d)
+      .map(x => ({f:x, lat:x.geo_point_2d.lat, lon:x.geo_point_2d.lon}))});
+  if (!v2) throw new Error('ODS indisponible');
+  return v2;
+}
+
+/* ---------- Chargement progressif et fusion ---------- */
+let loadSeq = 0, userPicked = false;
+function load(c) {
+  const seq = ++loadSeq, r = +$('#radius').value;
+  const got = {city:[], osm:[], reg:[]};
+  let pending = 0, anyOk = false;
+  userPicked = false;
+  const refresh = () => {
+    if (seq !== loadSeq) return;   // une recherche plus récente a pris le relais
+    // Priorité : villes > OpenStreetMap > jeu régional ; doublons à moins de 25 m écartés
+    const near = (t, l) => l.some(o => dist(o, t) < 25);
+    const res = [...got.city, ...got.osm.filter(t => !near(t, got.city))];
+    const base = [...res];
+    res.push(...got.reg.filter(t => !near(t, base)));
+    render(res, !pending);
+    if (pending) status(res.length ? `${res.length} toilettes · recherche en cours…` : 'Recherche…');
+    else if (!anyOk) status('Chargement impossible. Vérifiez votre connexion.');
+    else status(res.length ? `${res.length} toilettes trouvées` : 'Aucune toilette ici : élargissez le rayon.');
+  };
+  const track = (promise, key) => {
+    pending++;
+    promise.then(list => { got[key].push(...list); anyOk = true; }).catch(() => {})
+      .finally(() => { pending--; refresh(); });
+  };
+  status('Recherche…');
+  track(overpass(c, r), 'osm');
+  ODS.filter(s => inBox(c, s.box)).forEach(s =>
+    track(odsRows(s, c, r).then(rows => rows.map(x => fromODS(s, x)).filter(Boolean)), s.consolidated ? 'reg' : 'city'));
+}
+
+function render(list, final) {
+  const keepId = selected && selected.id;
+  group.clearLayers(); markers = new Map();
+  list.forEach(t => {
+    const m = L.marker([t.lat, t.lon], {icon:icon(false)})
+      .on('click', e => { L.DomEvent.stopPropagation(e); userPicked = true; select(t); }).addTo(group);
+    markers.set(t.id, m);
+  });
+  const kept = keepId && list.find(t => t.id === keepId);
+  if (kept) select(kept); else hideCard();
+  if (me && list.length && !userPicked && (final || !kept)) {   // met en avant la toilette la plus proche
+    const n = list.reduce((a, b) => dist(me, a) < dist(me, b) ? a : b);
+    select(n);
+    map.fitBounds([[me.lat, me.lon], [n.lat, n.lon]], {padding:[70, 70], maxZoom:17});
+  }
+}
+
+/* ---------- Fiche et itinéraire ---------- */
+const ios = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const apple = t => `https://maps.apple.com/?daddr=${t.lat},${t.lon}&dirflg=w`;
+const google = t => `https://www.google.com/maps/dir/?api=1&destination=${t.lat},${t.lon}&travelmode=walking`;
+
+function select(t) {
+  selected = t;
+  markers.forEach((m, id) => m.setIcon(icon(id === t.id)));
+  const k = t.t, det = [];
+  if (k.fee === 'yes') det.push('Payant'); else if (k.fee === 'no') det.push('Gratuit');
+  if (k.wheelchair === 'yes') det.push('Accessible PMR');
+  if (k.changing_table === 'yes') det.push('Table à langer');
+  if (k.access === 'customers') det.push('Réservé aux clients');
+  const d = me ? dist(me, t) : null;
+  const walk = d != null ? ` · ≈ ${Math.max(1, Math.round(d * 1.3 / 80))} min à pied` : '';
+  $('#card').innerHTML =
+    `<div class="top"><b>${esc(k.name || 'Toilettes publiques')}</b><span class="mut">${d != null ? fmt(d) : ''}</span></div>` +
+    (det.length ? `<div class="mut">${esc(det.join(' · '))}${walk}</div>` : walk ? `<div class="mut">${esc(walk.slice(3))}</div>` : '') +
+    (k.opening_hours ? `<div class="mut">🕒 ${esc(k.opening_hours)}</div>` : '') +
+    (k.address ? `<div class="mut">📍 ${esc(k.address)}</div>` : '') +
+    `<div class="acts"><a class="btn pri" href="${ios ? apple(t) : google(t)}" target="_blank" rel="noopener">Itinéraire</a>` +
+    `<a class="btn" href="${ios ? google(t) : apple(t)}" target="_blank" rel="noopener">${ios ? 'Google Maps' : 'Plans'}</a></div>` +
+    `<div class="mut" style="font-size:12px;margin-top:8px">Source : ${esc(t.source)} · Fond de carte © OpenStreetMap</div>`;
+  $('#card').style.display = 'block';
+}
+function hideCard() { selected = null; $('#card').style.display = 'none'; markers.forEach(m => m.setIcon(icon(false))); }
+map.on('click', hideCard);
+
+/* ---------- Géolocalisation ---------- */
+function locate() {
+  if (!navigator.geolocation) return status('Géolocalisation indisponible : déplacez la carte puis « Rechercher ici ».');
+  navigator.geolocation.watchPosition(p => {
+    me = {lat:p.coords.latitude, lon:p.coords.longitude};
+    if (meMarker) meMarker.setLatLng([me.lat, me.lon]);
+    else meMarker = L.circleMarker([me.lat, me.lon], {radius:8, color:'#fff', weight:3, fillColor:'#0a66ff', fillOpacity:1}).addTo(map);
+    if (!started) { started = true; map.setView([me.lat, me.lon], 16); load(me); }
+  }, () => status('Autorisez la localisation, ou déplacez la carte puis « Rechercher ici ».'),
+  {enableHighAccuracy:true, maximumAge:10000});
+}
+$('#search').onclick = () => { const c = map.getCenter(); load({lat:c.lat, lon:c.lng}); };
+$('#locate').onclick = () => { if (me) map.setView([me.lat, me.lon], 16); else locate(); };
+locate();
+</script>
+</body>
+</html>
